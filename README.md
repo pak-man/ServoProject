@@ -99,10 +99,6 @@ Dependencies:
   - gtkmm-3.0 >= 3.24
 ```
 
-### RP2040W
-
-Experimental, open-loop MicroPython servo drive for the Raspberry Pi Pico W, built up in three steps (plain PWM, then DMA, then PIO). See [RP2040W/README.md](RP2040W/README.md).
-
 ### CadFiles
 
 Holds all `.stl` and the original Freecad files
