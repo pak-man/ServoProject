@@ -1,48 +1,33 @@
 """
-Step 3: PIO-generated complementary H-bridge PWM, still fed by DMA.
+Step 3: one PIO state machine driving up to 6 RC servos, DMA-refreshed
+with no CPU involvement between commands.
 
-Hardware PWM slices (step 2) have no dead-time / break-before-make
-support, so a fast direction reversal can momentarily overlap the two
-H-bridge legs. This moves waveform generation into a small PIO
-program that drives both legs from a single state machine (via
-side-set) and inserts a fixed dead-time gap every switching period.
-That also frees the hardware PWM slices entirely and only costs one
-of the RP2040's 8 PIO state machines per axis -- 6 axes fit in 6 of
-the 8 SMs (2 blocks x 4 SMs each), which the 8 PWM slices used two at
-a time (step 2) would not have allowed.
+Steps 1/2 use one hardware PWM slice per servo, which already scales
+comfortably to 6 axes on its own (up to 16 channels across 8 slices).
+The reason to move to PIO here isn't running out of PWM slices -- it's
+consolidating all 6 axes onto a *single* state machine and a *single*
+DMA channel with frame-synchronised edges, freeing the other 7 PWM
+slices and 11 DMA channels for whatever else a 6-axis controller needs
+(current sensing, status LEDs, a 7th input, ...), which also mirrors
+how a real multi-channel motor/servo PIO driver (e.g. pybricks' RP2040
+port) consolidates channels onto few state machines.
 
-PIO program, one switching period:
-    dead time (both legs low)
-    -> drive leg A (GPIO_BASE)   high for `x` cycles (0 if unused)
-    -> drive leg B (GPIO_BASE+1) high for `y` cycles (0 if unused)
-Exactly one of x/y is non-zero per the HBridge2WirePwm-style command
-split (see motion_profile.split_signed), so the two legs are never
-driven at once. A fresh (x, y) pair is autopulled from the TX FIFO
-once every period (2x `out ... ,16` = 32 bits = pull_thresh); DMA
-keeps that FIFO fed from a precomputed profile, paced by the state
-machine's own TX DREQ, so a finished/underrun move simply stalls the
-state machine rather than glitching the outputs.
+Design: rc_servo_pio drives 6 consecutive GPIOs from one word per
+event (out(pins, 6)), each followed by a delay count (out(x, 26)) --
+see servo_frame.py for how a full 20 ms frame's pulses are turned into
+a short list of (mask, delay) events. Unlike a hardware PWM slice,
+this PIO program does *not* hold its output for free once fed: it
+actively re-pulls a new event every time one finishes, so if the DMA
+ever stopped mid-frame the state machine would simply stall. To get
+the same "set once, keeps going" behaviour as steps 1/2, the one DMA
+channel here uses the RP2040 DMA's read-side ring buffer: the frame
+buffer is padded to a fixed 8-word (32-byte) power-of-two region and
+the transfer count is set enormous, so DMA re-reads that same 8-word
+frame forever, re-triggering the PIO once per 20 ms, until
+set_pulses() is called again to swap in a new frame.
 
-Note: unlike step 2's separate pacer slice, here the switching period
-IS the motion-profile sample period. PIO only has two scratch
-registers (x, y) and both are consumed by the dead-time/on-time
-counters every period, so there is no spare register to "hold last
-value" the way a single-channel PWM idiom can (see the classic
-pico-examples pwm.pio, which relies on `pull(noblock)` falling back
-to scratch x for exactly that reason). A 5 kHz nominal switching rate
-keeps the profile buffer small while staying a normal brushed-motor
-drive frequency; because the loop length depends on whichever of x/y
-is active, the *actual* switching frequency varies somewhat with
-commanded duty (from ~5 kHz near full duty to a few times that near
-zero) -- fine for open-loop torque/speed control, not a fixed-carrier
-PWM.
-
-Register-level bits (PIO base addresses/offsets, TX DREQ numbering)
-come from the RP2040 datasheet: section 3 (PIO) and the DREQ table in
-section 2.5.3.
-
-Wiring: same as steps 1/2, IN1 -> GPIO2, IN2 -> GPIO3. The two pins
-must be consecutive GPIOs: PIO side-set claims a contiguous pin block.
+Wiring: GPIO2..GPIO7 = channel 0..5 (only channel 0 / GPIO2 has a
+servo attached for this test; the rest are simply inactive/low).
 
 Run with: mpremote run step3_pio_servo.py
 """
@@ -52,13 +37,14 @@ import time
 from machine import Pin
 from rp2 import PIO, StateMachine, DMA, asm_pio
 
-from motion_profile import trapezoid_profile, split_signed
+from motion_profile import linear_profile
+from servo_frame import build_frame, pad_frame, NUM_CHANNELS
 
-MOTOR_GPIO_BASE = 2  # GPIO2 = leg A (side-set bit 0), GPIO3 = leg B (side-set bit 1)
-MAX_DUTY = 1023
-DEAD_TIME_CYCLES = 16
-PIO_CLKDIV = 24.0  # 125 MHz / 24 ~= 5.2 MHz PIO clock -> ~5 kHz nominal switching period
-SWITCH_HZ_NOMINAL = 5000
+SERVO_GPIO_BASE = 2
+MIN_PULSE_US = 1000
+MAX_PULSE_US = 2000
+PIO_FREQ_HZ = 1_000_000  # 1 PIO cycle = 1 us, matches servo_frame.py's time base
+FRAME_WORDS = 8  # next power of two >= (NUM_CHANNELS events + 1 final segment)
 
 PIO0_BASE = 0x50200000
 PIO1_BASE = 0x50300000
@@ -75,66 +61,55 @@ def _pio_tx_dreq(pio_id, sm_num):
 
 
 @asm_pio(
-    sideset_init=(PIO.OUT_LOW, PIO.OUT_LOW),
+    out_init=(PIO.OUT_LOW,) * NUM_CHANNELS,
     out_shiftdir=PIO.SHIFT_RIGHT,
     autopull=True,
     pull_thresh=32,
 )
-def hbridge_pwm():
-    pull(block).side(0)
+def rc_servo_pio():
+    pull(block)
     wrap_target()
-    out(x, 16).side(0)[DEAD_TIME_CYCLES - 1]
-    out(y, 16).side(0)
-    jmp(not_x, "skip_a").side(0)
-    label("delay_a")
-    jmp(x_dec, "delay_a").side(1)
-    label("skip_a")
-    jmp(not_y, "skip_b").side(0)
-    label("delay_b")
-    jmp(y_dec, "delay_b").side(2)
-    label("skip_b")
+    out(pins, NUM_CHANNELS)
+    out(x, 26)
+    label("delay")
+    jmp(x_dec, "delay")
     wrap()
 
 
-class PioServoAxis:
-    def __init__(self, gpio_base, sm_id=0, pio_id=0, clkdiv=PIO_CLKDIV):
+class PioServoAxes:
+    def __init__(self, gpio_base, sm_id=0, pio_id=0):
         self._pio_id = pio_id
         self._sm_id = sm_id
         self._sm = StateMachine(
             pio_id * 4 + sm_id,
-            hbridge_pwm,
-            freq=int(125_000_000 / clkdiv),
-            sideset_base=Pin(gpio_base),
+            rc_servo_pio,
+            freq=PIO_FREQ_HZ,
+            out_base=Pin(gpio_base),
         )
         self._sm.active(1)
         self._dma = DMA()
         self._buf = None
 
-    @staticmethod
-    def _pack(duty_samples):
-        buf = array.array("I", [0] * len(duty_samples))
-        for i, d in enumerate(duty_samples):
-            leg_a, leg_b = split_signed(d, MAX_DUTY)
-            buf[i] = (leg_b << 16) | leg_a
-        return buf
-
-    def play(self, duty_samples, blocking=True):
-        self._buf = self._pack(duty_samples)
+    def set_pulses(self, pulses_us):
+        """pulses_us: list of up to NUM_CHANNELS pulse widths in us;
+        missing/0 entries are inactive channels."""
+        self._dma.active(0)
+        words = pad_frame(build_frame(pulses_us), FRAME_WORDS)
+        self._buf = array.array("I", words)
         self._dma.config(
             read=self._buf,
             write=_pio_txf_addr(self._pio_id, self._sm_id),
-            count=len(self._buf),
+            count=0xFFFFFFFF,  # effectively forever, until the next set_pulses()/stop()
             ctrl=self._dma.pack_ctrl(
                 size=2,  # 32-bit transfers
                 inc_read=True,
                 inc_write=False,  # always the same TX FIFO register
+                ring_sel=True,  # ring applies to the read address...
+                ring_size=5,  # ...wrapping every 2**5 = 32 bytes = FRAME_WORDS
                 treq_sel=_pio_tx_dreq(self._pio_id, self._sm_id),
             ),
             trigger=True,
         )
-        if blocking:
-            while self._dma.active():
-                time.sleep_ms(1)
 
     def stop(self):
         self._dma.active(0)
@@ -142,14 +117,15 @@ class PioServoAxis:
 
 
 def main():
-    axis = PioServoAxis(MOTOR_GPIO_BASE)
-    profile = trapezoid_profile(
-        peak_duty=600, accel_s=0.5, cruise_s=1.0, decel_s=0.5, tick_hz=SWITCH_HZ_NOMINAL
-    )
-    print("Playing %d samples via DMA -> PIO..." % len(profile))
-    axis.play(profile)
-    print("Move complete. Stopping state machine.")
-    axis.stop()
+    axes = PioServoAxes(SERVO_GPIO_BASE)
+    profile = linear_profile(MIN_PULSE_US, MAX_PULSE_US, duration_s=1.0, tick_hz=50)
+    print("Sweeping channel 0 over %d frames via PIO + ring-buffered DMA..." % len(profile))
+    for pulse_us in profile:
+        axes.set_pulses([pulse_us])
+        time.sleep_ms(20)
+    print("Done. Channel 0 keeps refreshing at 50 Hz with no further CPU help.")
+    time.sleep(2)
+    axes.stop()
 
 
 if __name__ == "__main__":

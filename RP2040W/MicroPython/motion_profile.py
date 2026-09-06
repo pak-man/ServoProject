@@ -1,36 +1,14 @@
-"""Shared open-loop motion helpers for the RP2040W servo steps.
+"""Shared open-loop motion helper for the RP2040W RC servo steps.
 
-No closed-loop feedback yet: these just produce a commanded duty-cycle
-vs. time table (a simple trapezoidal speed profile) that steps 2 and 3
-play back through DMA. `split_signed` mirrors the sign/magnitude split
-used by the existing ServoProject H-bridge driver
-(HBridge2WirePwm::setOutput in ArduinoSketch/PwmHandler.cpp): a
-positive command drives one leg, a negative command drives the other,
-and the idle leg is held at 0.
+No closed-loop feedback yet: this just produces a commanded
+pulse-width vs. time table (a linear sweep between two positions)
+that steps 2 and 3 play back through DMA instead of jumping the servo
+straight to a new position.
 """
 
 
-def split_signed(duty, max_duty=1023):
-    """Clamp duty to +/-max_duty and split it into (leg_neg, leg_pos)
-    magnitudes, exactly one of which is non-zero."""
-    if duty > max_duty:
-        duty = max_duty
-    elif duty < -max_duty:
-        duty = -max_duty
-    if duty >= 0:
-        return 0, duty
-    return -duty, 0
-
-
-def trapezoid_profile(peak_duty, accel_s, cruise_s, decel_s, tick_hz):
-    """Return a list of signed duty samples (one per 1/tick_hz seconds)
-    ramping linearly up to peak_duty, holding, then ramping back down.
-    peak_duty may be negative to run the move in reverse."""
-    n_accel = max(1, round(accel_s * tick_hz))
-    n_cruise = max(0, round(cruise_s * tick_hz))
-    n_decel = max(1, round(decel_s * tick_hz))
-
-    profile = [round(peak_duty * (i + 1) / n_accel) for i in range(n_accel)]
-    profile.extend([peak_duty] * n_cruise)
-    profile.extend(round(peak_duty * (n_decel - i - 1) / n_decel) for i in range(n_decel))
-    return profile
+def linear_profile(start_us, end_us, duration_s, tick_hz):
+    """Return a list of pulse widths in microseconds (one per
+    1/tick_hz seconds) ramping linearly from start_us to end_us."""
+    n = max(1, round(duration_s * tick_hz))
+    return [round(start_us + (end_us - start_us) * i / n) for i in range(n + 1)]
